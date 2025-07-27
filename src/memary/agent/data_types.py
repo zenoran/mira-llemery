@@ -72,17 +72,24 @@ class Message:
             return persona
         except FileNotFoundError:
             logging.info(f"{persona_txt} file does not exist.")
+            return ""  # Return empty string if file not found
 
     def load_contexts_from_json(self):
-        """Loads the contexts from the past chat json file."""
+        """Loads ALL contexts from the past chat json file.
+        Full history is preserved for memory/search purposes.
+        Limiting for LLM context happens separately when generating responses.
+        """
         try:
             with open(self.past_chat_json, "r") as file:
                 data_dicts = json.load(file)
 
+            total_stored = len(data_dicts)
+            logging.info(f"[CONTEXT] Loaded all {total_stored} stored messages from {self.past_chat_json}")
+
             return [Context(**data_dict) for data_dict in data_dicts]
-        except:
+        except Exception as e:
             logging.info(
-                f"{self.past_chat_json} file does not exist. Starts from empty contexts."
+                f"{self.past_chat_json} file does not exist or error loading: {e}. Starts from empty contexts."
             )
             return []
 
@@ -91,3 +98,36 @@ class Message:
         We don't save the system and user personas (first two messages)
         """
         save_json(self.past_chat_json, [message.to_dict() for message in self.llm_message['messages'][2:]])
+
+    def get_limited_messages_for_llm(self):
+        """Get messages limited to MAX_HISTORY_MESSAGES for LLM context.
+        This preserves full history in self.contexts but only returns recent messages for LLM.
+        """
+        try:
+            # Import here to avoid circular imports
+            try:
+                # Try to get from main.py first
+                import main
+                max_messages = getattr(main, 'MAX_HISTORY_MESSAGES', 30)
+            except Exception:
+                # Fallback to base_agent constant
+                from memary.agent.base_agent import MAX_HISTORY_MESSAGES
+                max_messages = MAX_HISTORY_MESSAGES
+            
+            # Get all messages (personas + chat history)
+            all_messages = self.llm_message["messages"]
+            
+            # If we have more than max_messages + 2 (for personas), limit the chat portion
+            if len(all_messages) > max_messages + 2:
+                # Keep first 2 (personas) + last max_messages chat messages
+                personas = all_messages[:2]  # System and user personas
+                recent_chat = all_messages[2:][-max_messages:]  # Last N chat messages
+                limited_messages = personas + recent_chat
+                logging.info(f"[LLM CONTEXT] Using last {max_messages} chat messages from {len(all_messages)-2} total (full history preserved)")
+                return limited_messages
+            else:
+                logging.info(f"[LLM CONTEXT] Using all {len(all_messages)} messages (under limit)")
+                return all_messages
+        except Exception as e:
+            logging.warning(f"Error limiting messages for LLM: {e}, using all messages")
+            return self.llm_message["messages"]

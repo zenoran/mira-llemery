@@ -16,8 +16,6 @@ class EntityKnowledgeStore(BaseMemory):
         self.entity_memory: list[EntityMemoryItem]
         """
         self.load_memory_from_file()
-        if self.entity:
-            self.add_memory(self.entity)
 
     @property
     def return_memory(self):

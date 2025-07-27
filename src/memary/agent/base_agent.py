@@ -24,8 +24,7 @@ from llama_index.multi_modal_llms.ollama import OllamaMultiModal
 from llama_index.multi_modal_llms.openai import OpenAIMultiModal
 
 from memary.agent.data_types import Context, Message
-from memary.agent.llm_api.tools import (ollama_chat_completions_request,
-                                        openai_chat_completions_request)
+from memary.agent.llm_api.tools import openai_chat_completions_request
 from memary.memory import EntityKnowledgeStore, MemoryStream
 from memary.synonym_expand.synonym import custom_synonym_expand_fn
 
@@ -36,6 +35,8 @@ CONTEXT_LENGTH = 4096
 EVICTION_RATE = 0.7
 NONEVICTION_LENGTH = 5
 TOP_ENTITIES = 20
+# History message limits - research shows degradation after ~30 messages
+MAX_HISTORY_MESSAGES = 30  # Maximum number of recent chat messages to include in LLM context
 
 
 def generate_string(entities):
@@ -73,50 +74,86 @@ class Agent(object):
         # initialize APIs
         self.load_llm_model(llm_model_name)
         self.load_vision_model(vision_model_name)
-        self.query_llm = Perplexity(
-            api_key=pplx_api_key, model="mistral-7b-instruct", temperature=0.5
-        )
-        self.gmaps = googlemaps.Client(key=googlemaps_api_key)
-        Settings.llm = self.llm
+        
+        # Initialize Perplexity only if API key is available
+        if pplx_api_key:
+            self.query_llm = Perplexity(
+                api_key=pplx_api_key, model="mistral-7b-instruct", temperature=0.5
+            )
+        else:
+            self.query_llm = None
+            print("Warning: PERPLEXITY_API_KEY not found. External search functionality will be limited.")
+        
+        # Initialize Google Maps only if API key is available
+        if googlemaps_api_key:
+            self.gmaps = googlemaps.Client(key=googlemaps_api_key)
+        else:
+            self.gmaps = None
+            print("Warning: GOOGLEMAPS_API_KEY not found. Location functionality will be limited.")
+        
+        # Only set Settings.llm if it wasn't already configured
+        if Settings.llm is None:
+            Settings.llm = self.llm
         Settings.chunk_size = 512
         
         self.falkordb_url = os.getenv("FALKORDB_URL")
+        neo4j_url = os.getenv("NEO4J_URL")
+        neo4j_password = os.getenv("NEO4J_PW")
+        
+        # Initialize graph store only if database credentials are available
+        self.graph_store = None
         if self.falkordb_url is not None:
-            from llama_index.graph_stores.falkordb import FalkorDBGraphStore
-            # initialize FalkorDB graph resources
-            self.graph_store = FalkorDBGraphStore(self.falkordb_url, database=user_id, decode_responses=True)
-        else:
-            from llama_index.graph_stores.neo4j import Neo4jGraphStore
-            # Neo4j credentials
-            self.neo4j_username = "neo4j"
-            self.neo4j_password = os.getenv("NEO4J_PW")
-            self.neo4j_url = os.getenv("NEO4J_URL")
-            database = "neo4j"
+            try:
+                from llama_index.graph_stores.falkordb import FalkorDBGraphStore
+                # initialize FalkorDB graph resources
+                self.graph_store = FalkorDBGraphStore(self.falkordb_url, database=user_id, decode_responses=True)
+                print("Connected to FalkorDB graph store")
+            except Exception as e:
+                print(f"Warning: Failed to connect to FalkorDB: {e}")
+        elif neo4j_url and neo4j_password:
+            try:
+                from llama_index.graph_stores.neo4j import Neo4jGraphStore
+                # Neo4j credentials
+                self.neo4j_username = "neo4j"
+                self.neo4j_password = neo4j_password
+                self.neo4j_url = neo4j_url
+                database = "neo4j"
 
-            # initialize Neo4j graph resources
-            self.graph_store = Neo4jGraphStore(
-                username=self.neo4j_username,
-                password=self.neo4j_password,
-                url=self.neo4j_url,
-                database=database,
-            )
+                # initialize Neo4j graph resources
+                self.graph_store = Neo4jGraphStore(
+                    username=self.neo4j_username,
+                    password=self.neo4j_password,
+                    url=self.neo4j_url,
+                    database=database,
+                )
+                print("Connected to Neo4j graph store")
+            except Exception as e:
+                print(f"Warning: Failed to connect to Neo4j: {e}")
+        else:
+            print("Warning: No graph database configured. Please set FALKORDB_URL or both NEO4J_URL and NEO4J_PW.")
 
         self.vantage_key = os.getenv("ALPHA_VANTAGE_API_KEY")
 
-        self.storage_context = StorageContext.from_defaults(
-            graph_store=self.graph_store
-        )
-        graph_rag_retriever = KnowledgeGraphRAGRetriever(
-            storage_context=self.storage_context,
-            verbose=True,
-            llm=self.llm,
-            retriever_mode="keyword",
-            synonym_expand_fn=custom_synonym_expand_fn,
-        )
+        # Initialize storage context and query engine only if graph store is available
+        if self.graph_store:
+            self.storage_context = StorageContext.from_defaults(
+                graph_store=self.graph_store
+            )
+            graph_rag_retriever = KnowledgeGraphRAGRetriever(
+                storage_context=self.storage_context,
+                verbose=True,
+                llm=self.llm,
+                retriever_mode="keyword",
+                synonym_expand_fn=custom_synonym_expand_fn,
+            )
 
-        self.query_engine = RetrieverQueryEngine.from_args(
-            graph_rag_retriever,
-        )
+            self.query_engine = RetrieverQueryEngine.from_args(
+                graph_rag_retriever,
+            )
+        else:
+            self.storage_context = None
+            self.query_engine = None
+            print("Warning: Knowledge graph functionality is disabled due to missing database configuration.")
 
         self.debug = debug
         self.tools = {}
@@ -133,6 +170,12 @@ class Agent(object):
         return f"Agent {self.name}"
 
     def load_llm_model(self, llm_model_name):
+        # Check if Settings.llm is already configured (e.g., by main.py)
+        if Settings.llm is not None:
+            print(f"Using pre-configured LLM: {type(Settings.llm).__name__}")
+            self.llm = Settings.llm
+            return
+            
         if llm_model_name == "gpt-3.5-turbo":
             os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
             self.openai_api_key = os.environ["OPENAI_API_KEY"]
@@ -155,11 +198,14 @@ class Agent(object):
             )
         else:
             try:
-                self.mm_model = OllamaMultiModal(model=vision_model_name)
+                self.mm_model = OllamaMultiModal(model=vision_model_name, request_timeout=60.0)
             except:
                 raise ("Please provide a proper vision_model_name.")
 
     def external_query(self, query: str):
+        if self.query_llm is None:
+            return "External search is not available. Please configure PERPLEXITY_API_KEY."
+        
         messages_dict = [
             {"role": "system", "content": "Be precise and concise."},
             {"role": "user", "content": query},
@@ -171,6 +217,9 @@ class Agent(object):
 
     def search(self, query: str) -> str:
         """Search the knowledge graph or perform search on the web if information is not present in the knowledge graph"""
+        if self.query_engine is None:
+            return self.external_query(query)
+        
         response = self.query_engine.query(query)
 
         if response.metadata is None:
@@ -180,6 +229,9 @@ class Agent(object):
 
     def locate(self, query: str) -> str:
         """Finds the current geographical location"""
+        if self.gmaps is None:
+            return "Location services are not available. Please configure GOOGLEMAPS_API_KEY."
+        
         location = geocoder.ip("me")
         lattitude, longitude = location.latlng[0], location.latlng[1]
 
@@ -206,6 +258,9 @@ class Agent(object):
 
     def stocks(self, query: str) -> str:
         """Get the stock price of the company given the ticker"""
+        if not self.vantage_key:
+            return "Stock price lookup is not available. Please configure ALPHA_VANTAGE_API_KEY."
+        
         request_api = requests.get(
             r"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol="
             + query
@@ -231,6 +286,10 @@ class Agent(object):
         return response
 
     def write_back(self):
+        if self.storage_context is None:
+            print("Warning: Cannot write back to knowledge graph - no database configured")
+            return
+            
         documents = SimpleDirectoryReader(
             input_files=["data/external_response.txt"]
         ).load_data()
@@ -250,6 +309,9 @@ class Agent(object):
         Returns:
             bool: True if the query is in the knowledge graph, False otherwise
         """
+        if self.query_engine is None:
+            return False
+            
         response = self.query_engine.query(query)
 
         if response.metadata is None:
@@ -289,7 +351,7 @@ class Agent(object):
             }
         )
         llm_message_chat["messages"].extend(
-            [context.to_dict() for context in self.message.llm_message["messages"]]
+            [context.to_dict() for context in self.message.get_limited_messages_for_llm()]
         )
         llm_message_chat.pop("knowledge_entity_store")
         llm_message_chat.pop("memory_stream")
@@ -329,14 +391,14 @@ class Agent(object):
         logging.info(f"Contexts summarized successfully. \n summary: {response}")
         logging.info(f"Total tokens after eviction: {total_tokens*EVICTION_RATE}")
 
-    def _get_chat_response(self, llm_message_chat: str) -> str:
+    def _get_chat_response(self, llm_message_chat) -> tuple:
         """Get response from the LLM chat model.
 
         Args:
-            llm_message_chat (str): query to get response for
+            llm_message_chat: query to get response for
 
         Returns:
-            str: response from the LLM chat model
+            tuple: (response, total_tokens)
         """
         if self.model == "gpt-3.5-turbo":
             response = openai_chat_completions_request(
@@ -344,14 +406,27 @@ class Agent(object):
             )
             total_tokens = response["usage"]["total_tokens"]
             response = str(response["choices"][0]["message"]["content"])
-        else:  # default to Ollama model
-            response = ollama_chat_completions_request(
-                llm_message_chat["messages"], self.model
-            )
-            total_tokens = response.get(
-                "prompt_eval_count", 0
-            )  # if 'prompt_eval_count' not present then query is cached
-            response = str(response["message"]["content"])
+        else:  # Use configured LlamaIndex LLM (LlamaCPP or other)
+            from llama_index.core import Settings
+            from llama_index.core.llms import ChatMessage, MessageRole
+            
+            # Convert messages to LlamaIndex format
+            messages = []
+            for msg in llm_message_chat["messages"]:
+                role = MessageRole.USER if msg["role"] == "user" else (
+                    MessageRole.SYSTEM if msg["role"] == "system" else MessageRole.ASSISTANT
+                )
+                messages.append(ChatMessage(role=role, content=msg["content"]))
+            
+            # Use the configured LLM (LlamaCPP)
+            chat_response = Settings.llm.chat(messages)
+            response = str(chat_response.message.content)
+            
+            # Post-process response to remove any fake conversation turns
+            response = self._clean_response(response)
+            
+            total_tokens = 0  # Token counting not implemented for local models
+                
         return response, total_tokens
 
     def get_response(self) -> str:
@@ -393,7 +468,10 @@ class Agent(object):
 
         if return_entity:
             # the query above already adds final response to KG so entities will be present in the KG
-            return response, self.get_entity(self.query_engine.retrieve(query))
+            if self.query_engine:
+                return response, self.get_entity(self.query_engine.retrieve(query))
+            else:
+                return response, []
         return response
 
     def get_entity(self, retrieve) -> list[str]:
@@ -492,3 +570,227 @@ class Agent(object):
             elif tool == "stocks":
                 self.tools["stocks"] = self.stocks
         self._init_ReAct_agent()
+
+    def _clean_response(self, response: str) -> str:
+        """Clean response to remove any fake conversation turns or role labels.
+        
+        Args:
+            response (str): Raw response from the LLM
+            
+        Returns:
+            str: Cleaned response with fake conversations removed
+        """
+        import re
+        
+        # Remove any text that looks like fake conversation turns
+        # Pattern: user: ... assistant: ... or \nuser: ... \nassistant: ...
+        patterns = [
+            r'\nuser:\s*.*?(?=\nassistant:|\nuser:|$)',
+            r'\nassistant:\s*.*?(?=\nuser:|\nassistant:|$)',
+            r'user:\s*.*?(?=assistant:|user:|$)',
+            r'assistant:\s*.*?(?=user:|assistant:|$)',
+        ]
+        
+        cleaned = response
+        for pattern in patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Clean up any remaining artifacts
+        cleaned = re.sub(r'\n\s*\n+', '\n', cleaned)  # Remove multiple newlines
+        cleaned = cleaned.strip()
+        
+        # If the response got completely cleaned (was all fake conversation), 
+        # return just the first sentence before any fake turns
+        if not cleaned or len(cleaned) < 10:
+            # Extract first sentence/paragraph before any fake conversation
+            lines = response.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line and not re.match(r'^(user|assistant):\s*', line, re.IGNORECASE):
+                    return line
+            return "I'm here to help! How can I assist you?"
+        
+        return cleaned
+
+    def get_response(self) -> str:
+        """Get response from the RAG model.
+
+        Returns:
+            str: response from the RAG model
+        """
+        llm_message_chat = self._change_llm_message_chat()
+        response, total_tokens = self._get_chat_response(llm_message_chat)
+        if total_tokens > CONTEXT_LENGTH * EVICTION_RATE:
+            logging.info("Evicting and summarizing contexts")
+            self._summarize_contexts(total_tokens)
+
+        self.message.save_contexts_to_json()
+
+        return response
+
+    def get_routing_agent_response(self, query, return_entity=False):
+        """Get response from the ReAct."""
+        response = ""
+        if self.debug:
+            # writes ReAct agent steps to separate file and modifies format to be readable in .txt file
+            with open("data/routing_response.txt", "w") as f:
+                orig_stdout = sys.stdout
+                sys.stdout = f
+                response = str(self.query(query))
+                sys.stdout.flush()
+                sys.stdout = orig_stdout
+            text = ""
+            with open("data/routing_response.txt", "r") as f:
+                text = f.read()
+
+            plain = ansi_strip(text)
+            with open("data/routing_response.txt", "w") as f:
+                f.write(plain)
+        else:
+            response = str(self.query(query))
+
+        if return_entity:
+            # the query above already adds final response to KG so entities will be present in the KG
+            if self.query_engine:
+                return response, self.get_entity(self.query_engine.retrieve(query))
+            else:
+                return response, []
+        return response
+
+    def get_entity(self, retrieve) -> list[str]:
+        """retrieve is a list of QueryBundle objects.
+        A retrieved QueryBundle object has a "node" attribute,
+        which has a "metadata" attribute.
+
+        example for "kg_rel_map":
+        kg_rel_map = {
+            'Harry': [['DREAMED_OF', 'Unknown relation'], ['FELL_HARD_ON', 'Concrete floor']],
+            'Potter': [['WORE', 'Round glasses'], ['HAD', 'Dream']]
+        }
+
+        Args:
+            retrieve (list[NodeWithScore]): list of NodeWithScore objects
+        return:
+            list[str]: list of string entities
+        """
+
+        entities = []
+        kg_rel_map = retrieve[0].node.metadata["kg_rel_map"]
+        for key, items in kg_rel_map.items():
+            # key is the entity of question
+            entities.append(key)
+            # items is a list of [relationship, entity]
+            entities.extend(item[1] for item in items)
+            if len(entities) > MAX_ENTITIES_FROM_KG:
+                break
+        entities = list(set(entities))
+        for exceptions in ENTITY_EXCEPTIONS:
+            if exceptions in entities:
+                entities.remove(exceptions)
+        return entities
+
+    def _init_ReAct_agent(self):
+        """Initializes ReAct Agent with list of tools in self.tools."""
+        tool_fns = []
+        for func in self.tools.values():
+            tool_fns.append(FunctionTool.from_defaults(fn=func))
+        self.routing_agent = ReActAgent.from_tools(tool_fns, llm=self.llm, verbose=True)
+
+    def _init_default_tools(self, default_tools: List[str]):
+        """Initializes ReAct Agent from the default list of tools memary provides.
+        List of strings passed in during initialization denoting which default tools to include.
+        Args:
+            default_tools (list(str)): list of tool names in string form
+        """
+
+        for tool in default_tools:
+            if tool == "search":
+                self.tools["search"] = self.search
+            elif tool == "locate":
+                self.tools["locate"] = self.locate
+            elif tool == "vision":
+                self.tools["vision"] = self.vision
+            elif tool == "stocks":
+                self.tools["stocks"] = self.stocks
+        self._init_ReAct_agent()
+
+    def add_tool(self, tool_additions: Dict[str, Callable[..., Any]]):
+        """Adds specified tools to be used by the ReAct Agent.
+        Args:
+            tools (dict(str, func)): dictionary of tools with names as keys and associated functions as values
+        """
+
+        for tool_name in tool_additions:
+            self.tools[tool_name] = tool_additions[tool_name]
+        self._init_ReAct_agent()
+
+    def remove_tool(self, tool_name: str):
+        """Removes specified tool from list of available tools for use by the ReAct Agent.
+        Args:
+            tool_name (str): name of tool to be removed in string form
+        """
+
+        if tool_name in self.tools:
+            del self.tools[tool_name]
+            self._init_ReAct_agent()
+        else:
+            raise ("Unknown tool_name provided for removal.")
+
+    def update_tools(self, updated_tools: List[str]):
+        """Resets ReAct Agent tools to only include subset of default tools.
+        Args:
+            updated_tools (list(str)): list of default tools to include
+        """
+
+        self.tools.clear()
+        for tool in updated_tools:
+            if tool == "search":
+                self.tools["search"] = self.search
+            elif tool == "locate":
+                self.tools["locate"] = self.locate
+            elif tool == "vision":
+                self.tools["vision"] = self.vision
+            elif tool == "stocks":
+                self.tools["stocks"] = self.stocks
+        self._init_ReAct_agent()
+
+    def _clean_response(self, response: str) -> str:
+        """Clean response to remove any fake conversation turns or role labels.
+        
+        Args:
+            response (str): Raw response from the LLM
+            
+        Returns:
+            str: Cleaned response with fake conversations removed
+        """
+        import re
+        
+        # Remove any text that looks like fake conversation turns
+        # Pattern: user: ... assistant: ... or \nuser: ... \nassistant: ...
+        patterns = [
+            r'\nuser:\s*.*?(?=\nassistant:|\nuser:|$)',
+            r'\nassistant:\s*.*?(?=\nuser:|\nassistant:|$)',
+            r'user:\s*.*?(?=assistant:|user:|$)',
+            r'assistant:\s*.*?(?=user:|assistant:|$)',
+        ]
+        
+        cleaned = response
+        for pattern in patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Clean up any remaining artifacts
+        cleaned = re.sub(r'\n\s*\n+', '\n', cleaned)  # Remove multiple newlines
+        cleaned = cleaned.strip()
+        
+        # If the response got completely cleaned (was all fake conversation), 
+        # return just the first sentence before any fake turns
+        if not cleaned or len(cleaned) < 10:
+            # Extract first sentence/paragraph before any fake conversation
+            lines = response.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line and not re.match(r'^(user|assistant):\s*', line, re.IGNORECASE):
+                    return line
+            return "I'm here to help! How can I assist you?"
+        
+        return cleaned
