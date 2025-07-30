@@ -668,7 +668,7 @@ async def chat_completion(request: Request):
                     logger.info(f"[CHAT BYPASS STREAMING RESPONSE] full_output: {full_response[:200]}{'...' if len(full_response) > 200 else ''}")
                     
                     # Log the complete response from LLM
-                    log_raw_llm_response(full_response, "BYPASS STREAMING")
+                    # log_raw_llm_response(full_response, "BYPASS STREAMING")
                     log_llm_response(full_response, "BYPASS STREAMING")
                     
                     # Check if response is broken and decide what to send
@@ -851,7 +851,7 @@ async def chat_completion(request: Request):
                     llm_messages.append(ChatMessage(role=role, content=msg["content"]))
                 
                 # Log what we're sending to the LLM
-                log_llm_request(llm_messages, "STREAMING")
+                # log_llm_request(llm_messages, "STREAMING")
                 
                 # Stream the response with memory context
                 logger.info("[CHAT STREAMING] Starting stream response...")
